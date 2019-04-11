@@ -58,15 +58,20 @@ int64_t GetTransactionHashableSize(const CTransaction& tx)
 * If only ''k'' but not ''s'' is canonically encoded, it is counted as ''k'' <code>SigHashOp</code>.
 * If both ''k'' and ''s'' are canonically encoded, the <code>SigHashOp</code> is counted as the lower value of ''k'' and ''s''.
 
-If the total <code>SigHashOp</code> for a script is found to be larger than 3, it is counted as only 3 <code>SigHashOp</code>.<ref>It should be noted that since sigops may exist in both scriptSig (non-standard and extremely rare) and scriptPubKey, in theory an input may have up to 6 <code>SigHashOp</code></ref>
+A script is first split into ''sub-scripts'' by any <code>OP_CODESEPARATOR</code>. For scripts without any <code>OP_CODESEPARATOR</code>, the whole script is a treated the only sub-script.
 
-<code>SigHashOp</code> of the generating transaction is defined to be 0.
+<code>SigHashOp</code> is counted for each sub-script. If the total <code>SigHashOp</code> is found to be larger than 3, it is counted as only 3 <code>SigHashOp</code>.
+
+<code>SigHashOp</code> of a script is the sum of all its sub-scripts.
 
 <code>SigHashOp</code> of a transaction is the sum of <code>SigHashOp</code> of each of its inputs.
+
+<code>SigHashOp</code> of the generating transaction is defined to be 0.
 
 <source lang="cpp">
 unsigned int CScript::GetSigHashOpCount() const
 {
+    unsigned int ret = 0;
     unsigned int n = 0;
     const_iterator pc = begin();
     std::vector<opcodetype> pushOpcodes;
@@ -75,6 +80,10 @@ unsigned int CScript::GetSigHashOpCount() const
         opcodetype opcode;
         if (!GetOp(pc, opcode))
             break; // The script is invalid anyway so we just return the current value
+        if (opcode == OP_CODESEPARATOR) {
+            ret += std::min(n, 3);
+            n = 0;
+        }
         if (opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY)
             n++;
         else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY) {
@@ -86,7 +95,7 @@ unsigned int CScript::GetSigHashOpCount() const
                 // If all the k + 2 opcodes before the CHECKMULTISIG are push only, and the number of signature
                 // is denoted as OP_s with s = 1 to 16, and s < k, we count it as s sigHashOp
                 if (pushOpcodes.size() >= nKeys + 2) {
-                    opcodetype nSigsCode = pushOpcodes.at(pushOpcodes.size() - nKeys - 2);
+                    opcodetype nSigsCode = pushOpcodes[pushOpcodes.size() - nKeys - 2];
                     if (nSigsCode >= OP_1 && nSigsCode <= OP_16) {
                         unsigned int nSigs = DecodeOP_N(nSigsCode);
                         if (nSigs < nKeys)
@@ -96,26 +105,20 @@ unsigned int CScript::GetSigHashOpCount() const
             }
             // If key count is not canonical, we assume it has 3 sigHashOp
             else
-                return 3;
+                n += 3;
         }
-        // It can't be more than 3 in total
-        if (n >= 3)
-            return 3;
-
         if (opcode <= OP_16)
             pushOpcodes.push_back(opcode);
         else
             pushOpcodes.clear();
     }
-    return n;
+    return (ret + std::min(n, 3));
 }
 </source>
 
 === Addition consensus rules ===
 
 The <code>SigHashOp</code> estimation depends on these extra consensus rules for pre-segregated witness scripts:
-# <code>nHashType</code> is confined to only 6 types: 0x01 for <code>SIGHASH_ALL</code>, 0x02 for <code>SIGHASH_NONE</code>, 0x03 for <code>SIGHASH_SINGLE</code>, 0x81 for <code>SIGHASH_ALL|SIGHASH_ANYONECANPAY</code>, 0x82 for <code>SIGHASH_NONE|SIGHASH_ANYONECANPAY</code>, and 0x83 for <code>SIGHASH_SINGLE|SIGHASH_ANYONECANPAY</code>. A signature with other <code>nHashType</code> is invalid.
-# Script with <code>OP_CODESEPARATOR</code>, even in an unexecuted conditional branch, is invalid.
 # Script that involves non-zero <code>FindAndDelete</code> operation is invalid.
 
 === SignatureHash size ===
@@ -138,9 +141,9 @@ A new relay and mempool policy is recommended to reject any unconfirmed transact
 This proposal employs a static analysis approach to estimate <code>SigHashSize</code> of transactions and blocks. This allows early rejection of violating transactions and blocks without executing the scripts at all. Despite that the size of <code>scriptCode</code> and <code>nHashType</code> are not considered in the estimation, the difference is negligible comparing with size of the main transaction body, since the overheads grows linearly with the number of sigops, which is mostly restricted by the 80,000 sigop cost limit (BIP141). <ref>Not totally, since it does not count the sigops inside the <code>scriptPubKey</code> of the outputs being spent, while inappropriately counting sigops in <code>scriptPubKey</code> of the current transaction.</ref>
 
 === SigHashOp estimation with extra script restrictions ===
-The <code>SigHashOp</code> estimation assumes that the <code>scriptCode</code> serialized ''within'' <code>SignatureHash</code> is a constant value for ''all'' sigops in a script. For this assumption to be true, we must disable any process that may modify the <code>scriptCode</code>, which are <code>OP_CODESEPARATOR</code> and <code>FindAndDelete</code>. Transactions involving <code>OP_CODESEPARATOR</code> and <code>FindAndDelete</code> are extremely rare in the main network, and arguably all of those were performed for testing purpose. Removal of these operations would have next to no functional loss, significantly simply the consensus-critical logic, and reduce the risks of unintentional consensus forks. <ref>https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2014-November/006878.html</ref>
+(TODO: Disabling OP_CODESEPARATOR is not necessary by counting properly. Removing FindAndDelete is still necessary since we can't count it without executing the script) The <code>SigHashOp</code> estimation assumes that the <code>scriptCode</code> serialized ''within'' <code>SignatureHash</code> is a constant value for ''all'' sigops in a script. For this assumption to be true, we must disable any process that may modify the <code>scriptCode</code>, which are <code>OP_CODESEPARATOR</code> and <code>FindAndDelete</code>. Transactions involving <code>OP_CODESEPARATOR</code> and <code>FindAndDelete</code> are extremely rare in the main network, and arguably all of those were performed for testing purpose. Removal of these operations would have next to no functional loss, significantly simply the consensus-critical logic, and reduce the risks of unintentional consensus forks. <ref>https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2014-November/006878.html</ref>
 
-The <code>SigHashOp</code> estimation also assumes that only 6 <code>nHashType</code> are allowed. This is a relay policy in reference implementation since v0.8.0 in 2013, and transactions with violating signatures are extremely rare in the main network. However, at consensus level, <code>SigHashOp</code> could be any value from 0 to 255, and a <code>SIGHASH</code> type could be encoded in multiple ways. For example, there are 116 ways to denote <code>SIGHASH_ALL</code>. Since <code>nHashType</code> is serialized inside <code>SignatureHash</code>, the <code>sighash</code> produced by different <code>nHashType</code> are not the same, even if all of them were <code>SIGHASH_ALL</code>.
+(TODO: we can cache the midstate so it is not necessary to remove non-standard hashtypes) The <code>SigHashOp</code> estimation also assumes that only 6 <code>nHashType</code> are allowed. This is a relay policy in reference implementation since v0.8.0 in 2013, and transactions with violating signatures are extremely rare in the main network. However, at consensus level, <code>SigHashOp</code> could be any value from 0 to 255, and a <code>SIGHASH</code> type could be encoded in multiple ways. For example, there are 116 ways to denote <code>SIGHASH_ALL</code>. Since <code>nHashType</code> is serialized inside <code>SignatureHash</code>, the <code>sighash</code> produced by different <code>nHashType</code> are not the same, even if all of them were <code>SIGHASH_ALL</code>.
 
 With all these extra consensus rules implemented and proper code refactoring<ref>https://github.com/bitcoin/bitcoin/pull/8654</ref>, we could be assured that <code>SignatureHash</code> is performed not more than once in each script for each <code>nHashType</code>, due to the invariability of <code>scriptCode</code>. The 6 <code>nHashType</code> limitation further guarantees that each script, with whatever number of sigops, would never perform <code>SignatureHash</code> for more than approximately 3 times of <code>TxHashableSize</code> (excluding some linearly growing overhead), as shown below:
 
